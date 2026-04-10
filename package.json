@@ -1,0 +1,20 @@
+{
+  "name": "dtcwriter-proxy",
+  "version": "1.0.0",
+  "description": "DTCWriter reverse proxy backend",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node src/server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "http-proxy-middleware": "^2.0.6",
+    "cors": "^2.8.5",
+    "cookie-parser": "^1.4.6",
+    "express-session": "^1.17.3",
+    "dotenv": "^16.3.1",
+    "node-fetch": "^2.7.0",
+    "helmet": "^7.1.0"
+  }
+}
