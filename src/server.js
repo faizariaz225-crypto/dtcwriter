@@ -1,5 +1,5 @@
 /**
- * DTCWriter Reverse Proxy Server — Revised
+ * DTCWriter Reverse Proxy Server — v2 (Cache & Auth Fix)
  *
  * Fixes in this version:
  *  1. Origin/Referer spoofed to match second site (CSRF bypass)
@@ -12,6 +12,9 @@
  *  8. CORS preflight handled
  *  9. Expanded default strip headers
  * 10. Session cookie secure for Render (HTTPS)
+ * 11. FIX: no-store Cache-Control on all /api routes (eliminates 304 stale)
+ * 12. FIX: /api/proxy-config now accessible to authenticated customers (fixes 401)
+ * 13. FIX: /api/auth/me and /api/users/me explicitly set no-store header
  */
 
 if (process.env.NODE_ENV !== 'production') require('dotenv').config();
@@ -121,6 +124,15 @@ app.use(session({
 
 app.use(express.static(path.join(__dirname, '../public')));
 
+// ─── Disable caching for all API routes (fixes 304 stale responses) ──────────
+app.use('/api', (req, res, next) => {
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+  res.setHeader('Pragma', 'no-cache');
+  res.setHeader('Expires', '0');
+  res.setHeader('Surrogate-Control', 'no-store');
+  next();
+});
+
 // ─── Auth middleware ──────────────────────────────────────────────────────────
 function requireAdmin(req, res, next) {
   if (req.session?.role === 'admin') return next();
@@ -153,6 +165,7 @@ app.post('/api/auth/login', (req, res) => {
 app.post('/api/auth/logout', (req, res) => req.session.destroy(() => res.json({ ok: true })));
 
 app.get('/api/auth/me', (req, res) => {
+  res.setHeader('Cache-Control', 'no-store');
   if (!req.session?.role) return res.status(401).json({ error: 'Not logged in' });
   res.json({ role: req.session.role, userId: req.session.userId, username: req.session.username });
 });
@@ -186,6 +199,7 @@ app.delete('/api/users/:id', requireAdmin, (req, res) => {
 });
 
 app.get('/api/users/me', requireAuth, (req, res) => {
+  res.setHeader('Cache-Control', 'no-store');
   if (req.session.role === 'admin') return res.json({ role: 'admin' });
   const user = db.users.find(u => u.id === req.session.userId);
   if (!user) return res.status(404).json({ error: 'Not found' });
@@ -256,7 +270,13 @@ app.delete('/api/issues/:id', requireAdmin, (req, res) => {
 });
 
 // ─── Proxy config routes ──────────────────────────────────────────────────────
-app.get('/api/proxy-config', requireAdmin, (req, res) => res.json(db.proxyConfig));
+app.get('/api/proxy-config', requireAuth, (req, res) => {
+  // Admins get full config; customers get only what they need to use the proxy
+  if (req.session.role === 'admin') return res.json(db.proxyConfig);
+  // Customers only need targetUrl and mode to connect through the proxy
+  const { targetUrl, mode } = db.proxyConfig;
+  res.json({ targetUrl, mode });
+});
 
 app.put('/api/proxy-config', requireAdmin, (req, res) => {
   const { targetUrl, mode, cookies, headers, stripResponseHeaders } = req.body;
