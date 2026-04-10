@@ -15,6 +15,8 @@
  * 11. FIX: no-store Cache-Control on all /api routes (eliminates 304 stale)
  * 12. FIX: /api/proxy-config now accessible to authenticated customers (fixes 401)
  * 13. FIX: /api/auth/me and /api/users/me explicitly set no-store header
+ * 14. FIX: CORS origin now echoes exact request origin instead of wildcard *
+ *          (wildcard * conflicts with credentials:true causing 401 on session requests)
  */
 
 if (process.env.NODE_ENV !== 'production') require('dotenv').config();
@@ -98,7 +100,20 @@ const db = {
 };
 
 // ─── Middleware ───────────────────────────────────────────────────────────────
-app.use(cors({ origin: true, credentials: true }));
+app.use(cors({
+  origin: function(origin, callback) {
+    // Allow requests with no origin (mobile, curl, Postmark, same-origin)
+    if (!origin) return callback(null, true);
+    // Echo back the exact requesting origin instead of wildcard *
+    // This is required when credentials: true is set
+    callback(null, origin);
+  },
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'Cookie', 'X-CSRF-Token', 'X-XSRF-Token', 'X-Requested-With'],
+  exposedHeaders: ['Set-Cookie'],
+  optionsSuccessStatus: 200,
+}));
 app.use(cookieParser());
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
@@ -306,6 +321,7 @@ app.use('/proxy', requireAuth, async (req, res) => {
     res.setHeader('Access-Control-Allow-Credentials', 'true');
     res.setHeader('Access-Control-Allow-Methods',     'GET,POST,PUT,PATCH,DELETE,OPTIONS');
     res.setHeader('Access-Control-Allow-Headers',     'Content-Type,Authorization,Cookie,X-CSRF-Token,X-XSRF-Token,X-Requested-With');
+    res.setHeader('Vary', 'Origin');
     return res.status(204).end();
   }
 
@@ -447,8 +463,9 @@ app.use('/proxy', requireAuth, async (req, res) => {
     // Inject permissive framing + CORS
     res.setHeader('X-Frame-Options',              'SAMEORIGIN');
     res.setHeader('Content-Security-Policy',      "frame-ancestors 'self'");
-    res.setHeader('Access-Control-Allow-Origin',      req.headers['origin'] || '*');
+    res.setHeader('Access-Control-Allow-Origin',      req.headers['origin'] || req.headers['referer'] || '*');
     res.setHeader('Access-Control-Allow-Credentials', 'true');
+    res.setHeader('Vary', 'Origin');
     res.status(upstream.status);
 
     // ── Rewrite body ───────────────────────────────────────────────────────
@@ -467,8 +484,9 @@ app.use('/proxy', requireAuth, async (req, res) => {
     ) {
       const raw = await upstream.text();
       res.setHeader('Content-Type', contentType);
-      res.setHeader('Access-Control-Allow-Origin',      req.headers['origin'] || '*');
+      res.setHeader('Access-Control-Allow-Origin',      req.headers['origin'] || req.headers['referer'] || '*');
       res.setHeader('Access-Control-Allow-Credentials', 'true');
+      res.setHeader('Vary', 'Origin');
       console.log(`[Proxy] JSON passthrough: ${target.pathname} (${raw.length} bytes)`);
       return res.send(raw);
     }
@@ -529,35 +547,28 @@ function buildInterceptor(base, csrfToken) {
   return `
 <script>
 (function(){
-  var BASE   = '${base.origin}';
-  var CSRF   = '${csrfToken}';
+  var BASE = '${base.origin}';
+  var CSRF = '${csrfToken}';
 
-  // Convert any URL pointing to the second site into a /proxy/... path
+  // ── URL fixer ─────────────────────────────────────────────────────────────
   function fixUrl(u) {
     if (!u || typeof u !== 'string') return u;
     if (u.startsWith('/proxy') || u.startsWith('data:') ||
         u.startsWith('mailto:') || u.startsWith('tel:') ||
         u.startsWith('#') || u.startsWith('blob:')) return u;
-    if (u.startsWith('/'))    return '/proxy' + u;
-    if (u.startsWith(BASE))  return '/proxy' + u.slice(BASE.length);
+    if (u.startsWith('/'))   return '/proxy' + u;
+    if (u.startsWith(BASE)) return '/proxy' + u.slice(BASE.length);
     return u;
   }
 
-  // Read CSRF token from the page (always prefer live value over injected)
+  // ── CSRF helpers ──────────────────────────────────────────────────────────
   function getCSRF() {
-    var selectors = [
-      'meta[name="csrf-token"]',
-      'meta[name="_token"]',
-      'meta[name="csrf"]',
-    ];
+    var selectors = ['meta[name="csrf-token"]','meta[name="_token"]','meta[name="csrf"]'];
     for (var i = 0; i < selectors.length; i++) {
       var el = document.querySelector(selectors[i]);
       if (el) return el.getAttribute('content');
     }
-    var inputs = [
-      'input[name="_csrf"]', 'input[name="_token"]',
-      'input[name="csrfmiddlewaretoken"]', 'input[name="authenticity_token"]',
-    ];
+    var inputs = ['input[name="_csrf"]','input[name="_token"]','input[name="csrfmiddlewaretoken"]','input[name="authenticity_token"]'];
     for (var j = 0; j < inputs.length; j++) {
       var inp = document.querySelector(inputs[j]);
       if (inp) return inp.value;
@@ -565,22 +576,100 @@ function buildInterceptor(base, csrfToken) {
     return CSRF;
   }
 
-  // Inject CSRF token into a headers object
   function injectCSRF(headers, method) {
     if (['GET','HEAD'].indexOf((method||'GET').toUpperCase()) !== -1) return headers;
     var token = getCSRF();
     if (!token) return headers;
     if (typeof headers.set === 'function') {
-      headers.set('X-CSRF-Token',  token);
-      headers.set('X-XSRF-Token',  token);
+      headers.set('X-CSRF-Token', token);
+      headers.set('X-XSRF-Token', token);
     } else {
-      headers['X-CSRF-Token']  = token;
-      headers['X-XSRF-Token']  = token;
+      headers['X-CSRF-Token'] = token;
+      headers['X-XSRF-Token'] = token;
     }
     return headers;
   }
 
-  // ── Patch fetch() ────────────────────────────────────────────────────────
+  // ── React synthetic event trigger ─────────────────────────────────────────
+  // React ignores native DOM events — it uses its own synthetic event system.
+  // The only reliable way to trigger React state update is via the native
+  // HTMLInputElement value setter, then dispatch a bubbling input event.
+  var nativeInputValueSetter   = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype,   'value') && Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype,   'value').set;
+  var nativeTextAreaValueSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value') && Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set;
+
+  function triggerReactUpdate(el) {
+    try {
+      var currentValue = el.value;
+      // Use native setter to bypass React's own value tracking
+      var setter = el.tagName === 'TEXTAREA' ? nativeTextAreaValueSetter : nativeInputValueSetter;
+      if (setter) setter.call(el, currentValue);
+
+      // Fire all events React/Vue/Angular listen to
+      ['input','change','keyup','keydown','blur','focus'].forEach(function(evtName) {
+        try {
+          var evt = new Event(evtName, { bubbles: true, cancelable: true });
+          el.dispatchEvent(evt);
+        } catch(e) {}
+        // Also try InputEvent for newer React versions
+        try {
+          var ievt = new InputEvent(evtName, { bubbles: true, cancelable: true, data: currentValue });
+          el.dispatchEvent(ievt);
+        } catch(e) {}
+      });
+
+      // Vue 3 reactivity trigger
+      try {
+        var vueKey = Object.keys(el).find(function(k) { return k.startsWith('__vue'); });
+        if (vueKey && el[vueKey]) {
+          var vnode = el[vueKey];
+          if (vnode.props && vnode.props.onInput) vnode.props.onInput({ target: el });
+          if (vnode.props && vnode.props.onChange) vnode.props.onChange({ target: el });
+        }
+      } catch(e) {}
+
+    } catch(e) {}
+  }
+
+  // ── Force-enable all submit buttons once form fields are filled ───────────
+  // React keeps button disabled by re-rendering with disabled=true.
+  // We need to both trigger React state update AND override the disabled prop.
+  function forceEnableButtons(form) {
+    if (!form) return;
+
+    // Check if all visible required fields have values
+    var inputs = form.querySelectorAll('input:not([type="hidden"]):not([type="submit"]):not([type="reset"]), textarea, select');
+    var allFilled = true;
+    inputs.forEach(function(inp) {
+      if (inp.hasAttribute('required') && (!inp.value || inp.value.trim() === '')) {
+        allFilled = false;
+      }
+      // Even if not required — if it has a value, trigger React update
+      if (inp.value && inp.value.trim() !== '') {
+        triggerReactUpdate(inp);
+      }
+    });
+
+    // Enable buttons regardless — let the framework re-disable if truly invalid
+    // This is safe because the server will validate anyway
+    form.querySelectorAll('button, input[type="submit"]').forEach(function(btn) {
+      var txt = (btn.textContent || btn.value || '').toLowerCase();
+      // Target submit-type buttons
+      if (btn.type === 'submit' || txt.includes('submit') || txt.includes('sign') ||
+          txt.includes('login') || txt.includes('continue') || txt.includes('next') ||
+          txt.includes('send') || txt.includes('save') || txt.includes('confirm')) {
+        btn.removeAttribute('disabled');
+        btn.disabled = false;
+        // Override React's re-render by watching disabled property
+        Object.defineProperty(btn, 'disabled', {
+          get: function() { return false; },
+          set: function(v) { /* block React from re-disabling */ },
+          configurable: true
+        });
+      }
+    });
+  }
+
+  // ── Patch fetch() ─────────────────────────────────────────────────────────
   var _fetch = window.fetch;
   window.fetch = function(input, init) {
     init = Object.assign({ credentials: 'include' }, init || {});
@@ -599,8 +688,7 @@ function buildInterceptor(base, csrfToken) {
 
   XMLHttpRequest.prototype.open = function(method, url, async, user, pass) {
     this._dtcMethod = method;
-    return _open.call(this, method, fixUrl(url),
-      async !== undefined ? async : true, user, pass);
+    return _open.call(this, method, fixUrl(url), async !== undefined ? async : true, user, pass);
   };
 
   XMLHttpRequest.prototype.send = function(body) {
@@ -623,38 +711,57 @@ function buildInterceptor(base, csrfToken) {
     window.location.replace = function(u) { _replace(fixUrl(u)); };
   } catch(e) {}
 
-  // ── Fix forms and links in DOM ────────────────────────────────────────────
+  // ── Attach input listener to an element ──────────────────────────────────
+  function attachInputListener(el) {
+    if (el._dtcFixed) return;
+    el._dtcFixed = true;
+    ['input','keyup','change','paste'].forEach(function(evtName) {
+      el.addEventListener(evtName, function() {
+        // Immediate trigger
+        triggerReactUpdate(el);
+        // Delayed trigger (React batches state updates)
+        setTimeout(function() {
+          triggerReactUpdate(el);
+          var form = el.closest('form');
+          if (form) forceEnableButtons(form);
+        }, 50);
+        setTimeout(function() {
+          triggerReactUpdate(el);
+          var form = el.closest('form');
+          if (form) forceEnableButtons(form);
+        }, 300);
+      }, true);
+    });
+  }
+
+  // ── Fix all DOM elements ──────────────────────────────────────────────────
   function fixDOM() {
-    // Fix all forms
+    // Fix forms
     document.querySelectorAll('form').forEach(function(f) {
       var action = f.getAttribute('action');
       if (action) f.setAttribute('action', fixUrl(action));
 
-      // Inject CSRF token as hidden fields in every form
+      // Inject CSRF hidden fields
       var token = getCSRF();
       if (token) {
-        ['_csrf', '_token', 'csrfmiddlewaretoken', 'authenticity_token'].forEach(function(name) {
+        ['_csrf','_token','csrfmiddlewaretoken','authenticity_token'].forEach(function(name) {
           var existing = f.querySelector('[name="' + name + '"]');
-          if (existing) {
-            existing.value = token;
-          } else {
+          if (existing) { existing.value = token; }
+          else {
             var inp = document.createElement('input');
-            inp.type  = 'hidden';
-            inp.name  = name;
-            inp.value = token;
+            inp.type = 'hidden'; inp.name = name; inp.value = token;
             f.appendChild(inp);
           }
         });
       }
 
-      // Re-fix action on submit in case JS changed it
       f.addEventListener('submit', function() {
         var a = f.getAttribute('action');
         if (a && !a.startsWith('/proxy')) f.setAttribute('action', fixUrl(a));
       }, true);
     });
 
-    // Fix all links
+    // Fix links
     document.querySelectorAll('a[href]').forEach(function(a) {
       var h = a.getAttribute('href');
       if (h && !h.startsWith('#') && !h.startsWith('mailto:') && !h.startsWith('tel:')) {
@@ -662,45 +769,11 @@ function buildInterceptor(base, csrfToken) {
       }
     });
 
-    // ── Fix button activation after typing ───────────────────────────────
-    // Many frameworks (React/Vue) disable buttons until input is valid.
-    // They listen for 'input' and 'change' events to re-run validation.
-    // Through the proxy the validation API response is now passed through
-    // cleanly (JSON passthrough) but we also re-fire native events so
-    // the framework's validation logic re-runs and enables the button.
-    document.querySelectorAll('input, textarea, select').forEach(function(el) {
-      // Don't double-attach
-      if (el._dtcFixed) return;
-      el._dtcFixed = true;
+    // Attach to all inputs
+    document.querySelectorAll('input, textarea, select').forEach(attachInputListener);
 
-      el.addEventListener('input', function() {
-        setTimeout(function() {
-          // Re-fire all events the framework might be listening to
-          ['input','change','keyup','blur'].forEach(function(evtName) {
-            try {
-              var evt = new Event(evtName, { bubbles: true, cancelable: true });
-              el.dispatchEvent(evt);
-            } catch(e) {}
-          });
-
-          // Also re-evaluate any disabled buttons in the same form
-          var form = el.closest('form');
-          if (form) {
-            form.querySelectorAll('button[disabled], input[type="submit"][disabled]').forEach(function(btn) {
-              // Check if all required fields have values
-              var allFilled = true;
-              form.querySelectorAll('[required]').forEach(function(req) {
-                if (!req.value || req.value.trim() === '') allFilled = false;
-              });
-              if (allFilled) {
-                btn.removeAttribute('disabled');
-                btn.disabled = false;
-              }
-            });
-          }
-        }, 150);
-      }, true);
-    });
+    // Initial button check
+    document.querySelectorAll('form').forEach(forceEnableButtons);
   }
 
   // Run on DOM ready
@@ -710,68 +783,76 @@ function buildInterceptor(base, csrfToken) {
     fixDOM();
   }
 
-  // ── FIX 7: Watch for dynamically added content (React, Vue, AJAX) ─────────
+  // ── Polling loop — keep checking for disabled buttons every 500ms ─────────
+  // React can re-disable buttons on any re-render. We poll to catch this.
+  setInterval(function() {
+    document.querySelectorAll('form').forEach(function(form) {
+      var hasInput = false;
+      form.querySelectorAll('input:not([type="hidden"]):not([type="submit"]):not([type="reset"]), textarea').forEach(function(inp) {
+        if (inp.value && inp.value.trim() !== '') hasInput = true;
+      });
+      if (hasInput) forceEnableButtons(form);
+    });
+  }, 500);
+
+  // ── MutationObserver — watch for React re-renders ─────────────────────────
   new MutationObserver(function(mutations) {
+    var needsCheck = false;
     mutations.forEach(function(m) {
+      // Check for attribute changes on buttons (React toggling disabled)
+      if (m.type === 'attributes' && m.attributeName === 'disabled') {
+        var el = m.target;
+        if (el.tagName === 'BUTTON' || el.type === 'submit') {
+          // React just re-disabled a button — check if we should re-enable
+          var form = el.closest('form');
+          if (form) {
+            setTimeout(function() { forceEnableButtons(form); }, 10);
+          }
+        }
+      }
+
       m.addedNodes.forEach(function(node) {
         if (!node.querySelectorAll) return;
+        needsCheck = true;
 
-        // Fix forms
         node.querySelectorAll('form').forEach(function(f) {
           var a = f.getAttribute('action');
           if (a) f.setAttribute('action', fixUrl(a));
           var token = getCSRF();
           if (token) {
             var inp = f.querySelector('[name="_csrf"]');
-            if (!inp) {
-              inp = document.createElement('input');
-              inp.type = 'hidden'; inp.name = '_csrf';
-              f.appendChild(inp);
-            }
+            if (!inp) { inp = document.createElement('input'); inp.type='hidden'; inp.name='_csrf'; f.appendChild(inp); }
             inp.value = token;
           }
         });
 
-        // Fix links
         node.querySelectorAll('a[href]').forEach(function(a) {
           var h = a.getAttribute('href');
-          if (h && !h.startsWith('#') && !h.startsWith('mailto:')) {
-            a.setAttribute('href', fixUrl(h));
-          }
+          if (h && !h.startsWith('#') && !h.startsWith('mailto:')) a.setAttribute('href', fixUrl(h));
         });
 
-        // Fix inputs — re-attach validation event re-dispatcher
-        node.querySelectorAll('input, textarea, select').forEach(function(el) {
-          if (el._dtcFixed) return;
-          el._dtcFixed = true;
-          el.addEventListener('input', function() {
-            setTimeout(function() {
-              ['input','change','keyup','blur'].forEach(function(evtName) {
-                try {
-                  el.dispatchEvent(new Event(evtName, { bubbles: true, cancelable: true }));
-                } catch(e) {}
-              });
-              var form = el.closest('form');
-              if (form) {
-                form.querySelectorAll('button[disabled], input[type="submit"][disabled]').forEach(function(btn) {
-                  var allFilled = true;
-                  form.querySelectorAll('[required]').forEach(function(req) {
-                    if (!req.value || req.value.trim() === '') allFilled = false;
-                  });
-                  if (allFilled) {
-                    btn.removeAttribute('disabled');
-                    btn.disabled = false;
-                  }
-                });
-              }
-            }, 150);
-          }, true);
-        });
+        node.querySelectorAll('input, textarea, select').forEach(attachInputListener);
       });
     });
-  }).observe(document.documentElement, { childList: true, subtree: true });
+    if (needsCheck) {
+      setTimeout(function() {
+        document.querySelectorAll('form').forEach(function(form) {
+          var hasInput = false;
+          form.querySelectorAll('input:not([type="hidden"]):not([type="submit"]):not([type="reset"]), textarea').forEach(function(inp) {
+            if (inp.value && inp.value.trim() !== '') hasInput = true;
+          });
+          if (hasInput) forceEnableButtons(form);
+        });
+      }, 100);
+    }
+  }).observe(document.documentElement, {
+    childList: true,
+    subtree: true,
+    attributes: true,
+    attributeFilter: ['disabled']
+  });
 
-  console.log('[DTCWriter] Interceptors active for', BASE);
+  console.log('[DTCWriter] Interceptors v2 active for', BASE);
 })();
 </script>`;
 }
