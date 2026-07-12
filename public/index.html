@@ -361,9 +361,10 @@
   <div class="proxy-topbar">
     <div style="font-family:var(--mono);font-size:13px;font-weight:700;color:var(--accent)">DTCWriter</div>
     <div class="proxy-url-bar"><span class="lock-icon">🔒</span><span id="proxy-display-url">/proxy/</span></div>
+    <button class="btn btn-ghost btn-sm" onclick="openProxyFullPage()">↗ Full page</button>
     <button class="proxy-close-btn" onclick="closeProxy()">✕ Close</button>
   </div>
-  <iframe id="proxy-iframe" src="" allow="*"></iframe>
+  <iframe id="proxy-iframe" src="" allow="clipboard-read; clipboard-write; microphone; camera; fullscreen"></iframe>
 </div>
 
 <!-- MODALS -->
@@ -825,6 +826,9 @@ function openProxy() {
   document.getElementById('proxy-iframe').src = src;
   document.getElementById('proxy-overlay').classList.add('open');
   document.body.style.overflow = 'hidden';
+}
+function openProxyFullPage() {
+  window.open('/proxy/', '_blank', 'noopener');
 }
 function closeProxy() {
   document.getElementById('proxy-overlay').classList.remove('open');
