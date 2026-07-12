@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: dtcwriter-proxy
+    runtime: node
+    buildCommand: npm ci
+    startCommand: npm start
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: SESSION_SECRET
+        generateValue: true
+      - key: PROXY_TARGET_URL
+        sync: false
+      - key: PROXY_COOKIES_JSON
+        sync: false
