@@ -42,6 +42,16 @@ app.set('trust proxy', 1);
 const PORT           = process.env.PORT || 3000;
 const SESSION_SECRET = process.env.SESSION_SECRET || 'dtcwriter-change-this-secret';
 
+function jsonEnv(name, fallback) {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+  try { return JSON.parse(raw); }
+  catch (error) {
+    console.warn(`[Config] Ignoring invalid ${name}: ${error.message}`);
+    return fallback;
+  }
+}
+
 // ─── CSRF Token store (per DTCWriter session) ─────────────────────────────────
 const csrfTokenStore = {};
 
@@ -88,16 +98,16 @@ const db = {
     { id: 4, userId: 3, title: 'API rate limit exceeded',       priority: 'Critical', status: 'Open',        date: '2025-04-09' },
   ],
   proxyConfig: {
-    targetUrl: '',
-    mode: 'server',
-    cookies: [],
-    headers: {},
-    stripResponseHeaders: [
+    targetUrl: process.env.PROXY_TARGET_URL || '',
+    mode: process.env.PROXY_MODE || 'server',
+    cookies: jsonEnv('PROXY_COOKIES_JSON', []),
+    headers: jsonEnv('PROXY_HEADERS_JSON', {}),
+    stripResponseHeaders: jsonEnv('PROXY_STRIP_HEADERS_JSON', [
       'x-frame-options',
       'content-security-policy',
       'x-xss-protection',
       'strict-transport-security',
-    ],
+    ]),
   },
   admins:  [{ username: 'admin', password: 'admin123' }],
   nextId: 6,
@@ -130,12 +140,13 @@ app.use(helmet({
 }));
 
 app.use(session({
+  name:              'dtc.sid',
   secret:            SESSION_SECRET,
   resave:            false,
   saveUninitialized: false,
   cookie: {
     httpOnly: true,
-    sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
+    sameSite: 'lax',
     secure:   process.env.NODE_ENV === 'production',
     maxAge:   8 * 60 * 60 * 1000,
   },
@@ -151,6 +162,8 @@ app.use('/api', (req, res, next) => {
   res.setHeader('Surrogate-Control', 'no-store');
   next();
 });
+
+app.get('/api/health', (req, res) => res.json({ ok: true }));
 
 // ─── Auth middleware ──────────────────────────────────────────────────────────
 function requireAdmin(req, res, next) {
@@ -308,6 +321,40 @@ app.put('/api/proxy-config', requireAdmin, (req, res) => {
 });
 
 // ─── REVERSE PROXY ────────────────────────────────────────────────────────────
+// ─── Proxy cookie helpers ────────────────────────────────────────────────────
+function parseCookieHeader(header = '') {
+  const result = new Map();
+  for (const part of String(header).split(';')) {
+    const i = part.indexOf('=');
+    if (i <= 0) continue;
+    const name = part.slice(0, i).trim();
+    const value = part.slice(i + 1).trim();
+    if (name && name !== 'dtc.sid') result.set(name, value);
+  }
+  return result;
+}
+
+function buildUpstreamCookieHeader(browserHeader, configuredCookies = []) {
+  const jar = parseCookieHeader(browserHeader);
+  // Admin-configured cookies intentionally override browser copies.
+  for (const cookie of configuredCookies) {
+    if (cookie && cookie.name) jar.set(String(cookie.name).trim(), String(cookie.value ?? ''));
+  }
+  return [...jar.entries()].map(([name, value]) => `${name}=${value}`).join('; ');
+}
+
+function rewriteUpstreamSetCookie(value) {
+  // The upstream cookie is stored on the proxy host, so its original Domain and
+  // Path must not be retained. The proxy is same-site with its iframe/new tab.
+  const cleaned = String(value)
+    .replace(/;\s*Domain=[^;]*/gi, '')
+    .replace(/;\s*Path=[^;]*/gi, '')
+    .replace(/;\s*SameSite=[^;]*/gi, '')
+    .replace(/;\s*Secure/gi, '')
+    .replace(/;\s*$/g, '');
+  return `${cleaned}; Path=/; Secure; SameSite=Lax`;
+}
+
 app.use('/proxy', requireAuth, async (req, res) => {
   const { targetUrl, cookies, headers: extraHeaders, stripResponseHeaders } = db.proxyConfig;
 
@@ -336,77 +383,60 @@ app.use('/proxy', requireAuth, async (req, res) => {
   const target  = new URL(subPath || '/', base);
 
   // ── Build cookie string ────────────────────────────────────────────────────
-  const injected     = (cookies || []).map(c => `${c.name}=${c.value}`).join('; ');
-  const fromBrowser  = req.headers['cookie'] || '';
-  const cookieHeader = [injected, fromBrowser].filter(Boolean).join('; ');
+  const cookieHeader = buildUpstreamCookieHeader(req.headers['cookie'] || '', cookies || []);
 
-  // ── FIX 1: Spoof origin/referer — tricks second site into allowing request ─
-  const forwardHeaders = {
-    'host':              base.host,
-    'origin':            base.origin,
-    'referer':           base.origin + (subPath || '/'),
-    'accept':            req.headers['accept']          || '*/*',
-    'accept-language':   req.headers['accept-language'] || 'en-US,en;q=0.9',
-    'accept-encoding':   'identity',
-    'user-agent':        req.headers['user-agent']      || 'Mozilla/5.0 DTCWriter-Proxy/1.0',
-    'x-forwarded-host':  base.host,
-    'x-forwarded-proto': 'https',
-    'x-requested-with':  'XMLHttpRequest',
-  };
-
-  if (cookieHeader)                     forwardHeaders['cookie']           = cookieHeader;
-  if (req.headers['content-type'])      forwardHeaders['content-type']     = req.headers['content-type'];
-  if (req.headers['x-requested-with'])  forwardHeaders['x-requested-with'] = req.headers['x-requested-with'];
-
-  // ── FIX 2: Replay saved CSRF token on every write request ─────────────────
-  const isWrite   = ['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method);
-  const savedCSRF = csrfTokenStore[req.session.id];
-
-  if (isWrite && savedCSRF) {
-    forwardHeaders['x-csrf-token'] = savedCSRF;
-    forwardHeaders['x-xsrf-token'] = savedCSRF;
-    console.log(`[Proxy] CSRF token injected: ${savedCSRF.substring(0, 12)}…`);
+  // Preserve application-specific headers used by modern frontends, while
+  // removing hop-by-hop headers and rewriting host/origin for the upstream.
+  const blockedRequestHeaders = new Set([
+    'host', 'cookie', 'connection', 'keep-alive', 'proxy-authenticate',
+    'proxy-authorization', 'te', 'trailer', 'transfer-encoding', 'upgrade',
+    'content-length', 'accept-encoding', 'origin', 'referer'
+  ]);
+  const forwardHeaders = {};
+  for (const [key, value] of Object.entries(req.headers)) {
+    if (!blockedRequestHeaders.has(key.toLowerCase()) && value !== undefined) {
+      forwardHeaders[key] = Array.isArray(value) ? value.join(', ') : value;
+    }
   }
+  Object.assign(forwardHeaders, {
+    host:                 base.host,
+    origin:               base.origin,
+    referer:              new URL(subPath || '/', base).toString(),
+    accept:               req.headers['accept'] || '*/*',
+    'accept-encoding':    'identity',
+    'user-agent':         req.headers['user-agent'] || 'Mozilla/5.0 DTCWriter-Proxy/1.0',
+    'x-forwarded-host':   base.host,
+    'x-forwarded-proto':  base.protocol.replace(':', ''),
+  });
+  if (cookieHeader) forwardHeaders.cookie = cookieHeader;
+
+  // Forward CSRF headers exactly as supplied by the upstream application.
+  // Generic token scraping/injection is intentionally avoided because it breaks
+  // rotating/double-submit tokens and is not a substitute for proper SSO.
+  const isWrite = ['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method);
 
   // Merge admin extra headers last — they override everything
   Object.assign(forwardHeaders, extraHeaders || {});
 
-  // ── FIX 4: Build body correctly per content-type ───────────────────────────
-  let body = undefined;
+  // ── Build request body ─────────────────────────────────────────────────────
+  // JSON and URL-encoded bodies have already been parsed by Express. Other
+  // content types (multipart uploads, text, binary) remain readable streams and
+  // are forwarded without reconstruction.
+  let body;
   if (isWrite) {
     const ct = (req.headers['content-type'] || '').toLowerCase();
-
     if (ct.includes('application/x-www-form-urlencoded')) {
-      const params = new URLSearchParams(req.body);
-      // FIX 3: Inject CSRF token into form fields under all common names
-      if (savedCSRF) {
-        params.set('_csrf',               savedCSRF);
-        params.set('_token',              savedCSRF);
-        params.set('csrfmiddlewaretoken', savedCSRF);
-        params.set('authenticity_token',  savedCSRF);
-      }
-      body = params.toString();
-      forwardHeaders['content-type']   = 'application/x-www-form-urlencoded';
+      body = new URLSearchParams(req.body || {}).toString();
+      forwardHeaders['content-type'] = 'application/x-www-form-urlencoded';
       forwardHeaders['content-length'] = Buffer.byteLength(body).toString();
-
-    } else if (ct.includes('multipart/form-data')) {
-      body = req; // stream raw — do not touch multipart boundary
-      forwardHeaders['content-type'] = req.headers['content-type'];
-
+    } else if (ct.includes('application/json') || ct.includes('+json')) {
+      body = JSON.stringify(req.body ?? {});
+      forwardHeaders['content-type'] = req.headers['content-type'] || 'application/json';
+      forwardHeaders['content-length'] = Buffer.byteLength(body).toString();
     } else {
-      // JSON or unknown
-      let parsed;
-      const raw = typeof req.body === 'string' ? req.body : JSON.stringify(req.body);
-      try { parsed = JSON.parse(raw); } catch { parsed = null; }
-      if (parsed && savedCSRF) {
-        parsed._csrf  = parsed._csrf  || savedCSRF;
-        parsed._token = parsed._token || savedCSRF;
-        body = JSON.stringify(parsed);
-      } else {
-        body = raw;
-      }
-      forwardHeaders['content-type']   = 'application/json';
-      forwardHeaders['content-length'] = Buffer.byteLength(body).toString();
+      body = req;
+      if (req.headers['content-type']) forwardHeaders['content-type'] = req.headers['content-type'];
+      if (req.headers['content-length']) forwardHeaders['content-length'] = req.headers['content-length'];
     }
   }
 
@@ -438,8 +468,9 @@ app.use('/proxy', requireAuth, async (req, res) => {
     upstream.headers.forEach((value, key) => {
       const lk = key.toLowerCase();
 
-      // Strip frame-busting / security headers
+      // Strip frame-busting, stale entity-length, and hop-by-hop headers.
       if (alwaysStrip.has(lk) || adminStrip.includes(lk)) return;
+      if (['set-cookie','content-length','content-encoding','transfer-encoding','connection','etag'].includes(lk)) return;
 
       // Forward CORS headers — replace origin with exact requesting origin
       // so credentials work correctly (wildcard * breaks credentialed requests)
@@ -473,19 +504,15 @@ app.use('/proxy', requireAuth, async (req, res) => {
         return;
       }
 
-      // FIX 5: Rewrite Set-Cookie for cross-site delivery
-      if (lk === 'set-cookie') {
-        const rewritten = value
-          .replace(/Domain=[^;,\s]+[;,]?\s*/gi, '') // strip original domain
-          .replace(/SameSite=\w+/gi, 'SameSite=None') // must be None cross-site
-          .replace(/;\s*$/, '')
-          + '; Secure; Path=/';
-        res.append('Set-Cookie', rewritten);
-        return;
-      }
-
       res.setHeader(key, value);
     });
+
+    // node-fetch v2 exposes separate Set-Cookie lines through raw(); forEach()
+    // may collapse them, which corrupts Expires values and session rotation.
+    const upstreamSetCookies = upstream.headers.raw()['set-cookie'] || [];
+    for (const cookie of upstreamSetCookies) {
+      res.append('Set-Cookie', rewriteUpstreamSetCookie(cookie));
+    }
 
     // Inject permissive framing + CORS
     res.setHeader('X-Frame-Options',              'SAMEORIGIN');
@@ -498,10 +525,7 @@ app.use('/proxy', requireAuth, async (req, res) => {
     // ── Rewrite body ───────────────────────────────────────────────────────
     const contentType = (upstream.headers.get('content-type') || '').toLowerCase();
 
-    // ── JSON / XML — pass through untouched so validation responses ─────────
-    // are never mangled by the URL rewriter. This is the main reason
-    // buttons stay disabled after typing — the validation API response
-    // was being rewritten and the JS couldn't parse it.
+    // ── JSON / XML / text — pass through untouched ─────────────────────────
     if (
       contentType.includes('application/json') ||
       contentType.includes('text/json')        ||
@@ -528,27 +552,17 @@ app.use('/proxy', requireAuth, async (req, res) => {
     if (isHtml || isCss || isJs) {
       let text = await upstream.text();
 
-      // FIX 2: Extract CSRF token from HTML and save for next POST
-      if (isHtml) {
-        const token = extractCSRFToken(text);
-        if (token) {
-          csrfTokenStore[req.session.id] = token;
-          console.log(`[Proxy] CSRF token saved: ${token.substring(0, 12)}…`);
-        }
-      }
+      // Do not scrape or synthesize CSRF tokens. The upstream application's
+      // own cookie/header mechanism is forwarded unchanged.
 
-      text = rewriteUrls(text, base, isHtml, isJs);
+      text = rewriteUrls(text, base, isHtml, false);
 
       // FIX 6+7: Inject runtime interceptor into every HTML page
       if (isHtml) {
-        const interceptor = buildInterceptor(base, savedCSRF || '');
+        const interceptor = buildInterceptor(base);
         text = text.replace(/<head([^>]*)>/i, m => m + interceptor);
 
-        // Fix forms with no action — default to current proxy path
-        text = text.replace(/<form([^>]*)>/gi, (m, attrs) => {
-          if (!attrs.includes('action')) return `<form${attrs} action="/proxy/">`;
-          return m;
-        });
+        // Native form behavior is left intact; the interceptor rewrites explicit actions.
       }
 
       res.setHeader('Content-Type', contentType);
@@ -573,316 +587,73 @@ app.use('/proxy', requireAuth, async (req, res) => {
 });
 
 // ─── Runtime interceptor injected into every proxied HTML page ────────────────
-function buildInterceptor(base, csrfToken) {
+function buildInterceptor(base) {
+  const upstreamOrigin = JSON.stringify(base.origin);
   return `
 <script>
 (function(){
-  var BASE = '${base.origin}';
-  var CSRF = '${csrfToken}';
+  'use strict';
+  var UPSTREAM_ORIGIN = ${upstreamOrigin};
 
-  // ── URL fixer ─────────────────────────────────────────────────────────────
-  function fixUrl(u) {
-    if (!u || typeof u !== 'string') return u;
-    if (u.startsWith('/proxy') || u.startsWith('data:') ||
-        u.startsWith('mailto:') || u.startsWith('tel:') ||
-        u.startsWith('#') || u.startsWith('blob:')) return u;
-    if (u.startsWith('/'))   return '/proxy' + u;
-    if (u.startsWith(BASE)) return '/proxy' + u.slice(BASE.length);
-    return u;
-  }
-
-  // ── CSRF helpers ──────────────────────────────────────────────────────────
-  function getCSRF() {
-    var selectors = ['meta[name="csrf-token"]','meta[name="_token"]','meta[name="csrf"]'];
-    for (var i = 0; i < selectors.length; i++) {
-      var el = document.querySelector(selectors[i]);
-      if (el) return el.getAttribute('content');
-    }
-    var inputs = ['input[name="_csrf"]','input[name="_token"]','input[name="csrfmiddlewaretoken"]','input[name="authenticity_token"]'];
-    for (var j = 0; j < inputs.length; j++) {
-      var inp = document.querySelector(inputs[j]);
-      if (inp) return inp.value;
-    }
-    return CSRF;
-  }
-
-  function injectCSRF(headers, method) {
-    if (['GET','HEAD'].indexOf((method||'GET').toUpperCase()) !== -1) return headers;
-    var token = getCSRF();
-    if (!token) return headers;
-    if (typeof headers.set === 'function') {
-      headers.set('X-CSRF-Token', token);
-      headers.set('X-XSRF-Token', token);
-    } else {
-      headers['X-CSRF-Token'] = token;
-      headers['X-XSRF-Token'] = token;
-    }
-    return headers;
-  }
-
-  // ── React synthetic event trigger ─────────────────────────────────────────
-  // React ignores native DOM events — it uses its own synthetic event system.
-  // The only reliable way to trigger React state update is via the native
-  // HTMLInputElement value setter, then dispatch a bubbling input event.
-  var nativeInputValueSetter   = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype,   'value') && Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype,   'value').set;
-  var nativeTextAreaValueSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value') && Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set;
-
-  function triggerReactUpdate(el) {
+  function proxify(value) {
+    if (!value || typeof value !== 'string') return value;
+    if (/^(data:|blob:|mailto:|tel:|javascript:|#)/i.test(value)) return value;
+    if (value === '/proxy' || value.startsWith('/proxy/')) return value;
     try {
-      var currentValue = el.value;
-      // Use native setter to bypass React's own value tracking
-      var setter = el.tagName === 'TEXTAREA' ? nativeTextAreaValueSetter : nativeInputValueSetter;
-      if (setter) setter.call(el, currentValue);
-
-      // Fire all events React/Vue/Angular listen to
-      ['input','change','keyup','keydown','blur','focus'].forEach(function(evtName) {
-        try {
-          var evt = new Event(evtName, { bubbles: true, cancelable: true });
-          el.dispatchEvent(evt);
-        } catch(e) {}
-        // Also try InputEvent for newer React versions
-        try {
-          var ievt = new InputEvent(evtName, { bubbles: true, cancelable: true, data: currentValue });
-          el.dispatchEvent(ievt);
-        } catch(e) {}
-      });
-
-      // Vue 3 reactivity trigger
-      try {
-        var vueKey = Object.keys(el).find(function(k) { return k.startsWith('__vue'); });
-        if (vueKey && el[vueKey]) {
-          var vnode = el[vueKey];
-          if (vnode.props && vnode.props.onInput) vnode.props.onInput({ target: el });
-          if (vnode.props && vnode.props.onChange) vnode.props.onChange({ target: el });
-        }
-      } catch(e) {}
-
-    } catch(e) {}
-  }
-
-  // ── Force-enable all submit buttons once form fields are filled ───────────
-  // React keeps button disabled by re-rendering with disabled=true.
-  // We need to both trigger React state update AND override the disabled prop.
-  function forceEnableButtons(form) {
-    if (!form) return;
-
-    // Check if all visible required fields have values
-    var inputs = form.querySelectorAll('input:not([type="hidden"]):not([type="submit"]):not([type="reset"]), textarea, select');
-    var allFilled = true;
-    inputs.forEach(function(inp) {
-      if (inp.hasAttribute('required') && (!inp.value || inp.value.trim() === '')) {
-        allFilled = false;
+      var resolved = new URL(value, UPSTREAM_ORIGIN + '/');
+      if (resolved.origin === UPSTREAM_ORIGIN) {
+        return '/proxy' + resolved.pathname + resolved.search + resolved.hash;
       }
-      // Even if not required — if it has a value, trigger React update
-      if (inp.value && inp.value.trim() !== '') {
-        triggerReactUpdate(inp);
-      }
-    });
-
-    // Enable buttons regardless — let the framework re-disable if truly invalid
-    // This is safe because the server will validate anyway
-    form.querySelectorAll('button, input[type="submit"]').forEach(function(btn) {
-      var txt = (btn.textContent || btn.value || '').toLowerCase();
-      // Target submit-type buttons
-      if (btn.type === 'submit' || txt.includes('submit') || txt.includes('sign') ||
-          txt.includes('login') || txt.includes('continue') || txt.includes('next') ||
-          txt.includes('send') || txt.includes('save') || txt.includes('confirm')) {
-        btn.removeAttribute('disabled');
-        btn.disabled = false;
-        // Override React's re-render by watching disabled property
-        Object.defineProperty(btn, 'disabled', {
-          get: function() { return false; },
-          set: function(v) { /* block React from re-disabling */ },
-          configurable: true
-        });
-      }
-    });
-  }
-
-  // ── Patch fetch() ─────────────────────────────────────────────────────────
-  var _fetch = window.fetch;
-  window.fetch = function(input, init) {
-    init = Object.assign({ credentials: 'include' }, init || {});
-    if (typeof input === 'string') {
-      input = fixUrl(input);
-    } else if (input && input.url) {
-      input = new Request(fixUrl(input.url), input);
+      // A separate API/CDN origin needs an explicit, owner-controlled proxy route.
+      console.warn('[DTCWriter] External origin not proxied:', resolved.origin, value);
+      return value;
+    } catch (_) {
+      return value;
     }
-    init.headers = injectCSRF(init.headers || {}, init.method);
-    return _fetch(input, init);
+  }
+
+  var nativeFetch = window.fetch && window.fetch.bind(window);
+  if (nativeFetch) {
+    window.fetch = function(input, init) {
+      init = Object.assign({}, init || {}, { credentials: 'include' });
+      if (input instanceof Request) {
+        input = new Request(proxify(input.url), input);
+      } else {
+        input = proxify(input);
+      }
+      return nativeFetch(input, init);
+    };
+  }
+
+  var nativeOpen = XMLHttpRequest.prototype.open;
+  XMLHttpRequest.prototype.open = function(method, url) {
+    var args = Array.prototype.slice.call(arguments);
+    args[1] = proxify(url);
+    return nativeOpen.apply(this, args);
   };
 
-  // ── Patch XMLHttpRequest ──────────────────────────────────────────────────
-  var _open = XMLHttpRequest.prototype.open;
-  var _send = XMLHttpRequest.prototype.send;
+  if (window.EventSource) {
+    var NativeEventSource = window.EventSource;
+    window.EventSource = function(url, options) {
+      return new NativeEventSource(proxify(url), Object.assign({ withCredentials: true }, options || {}));
+    };
+    window.EventSource.prototype = NativeEventSource.prototype;
+  }
 
-  XMLHttpRequest.prototype.open = function(method, url, async, user, pass) {
-    this._dtcMethod = method;
-    return _open.call(this, method, fixUrl(url), async !== undefined ? async : true, user, pass);
-  };
+  if (navigator.sendBeacon) {
+    var nativeBeacon = navigator.sendBeacon.bind(navigator);
+    navigator.sendBeacon = function(url, data) { return nativeBeacon(proxify(url), data); };
+  }
 
-  XMLHttpRequest.prototype.send = function(body) {
-    this.withCredentials = true;
-    if (['GET','HEAD'].indexOf((this._dtcMethod || 'GET').toUpperCase()) === -1) {
-      var token = getCSRF();
-      if (token) {
-        try { this.setRequestHeader('X-CSRF-Token', token); } catch(e) {}
-        try { this.setRequestHeader('X-XSRF-Token', token); } catch(e) {}
-      }
+  document.addEventListener('submit', function(event) {
+    var form = event.target;
+    if (form && form.tagName === 'FORM') {
+      var action = form.getAttribute('action');
+      if (action) form.setAttribute('action', proxify(action));
     }
-    return _send.call(this, body);
-  };
+  }, true);
 
-  // ── Patch location navigations ────────────────────────────────────────────
-  try {
-    var _assign  = window.location.assign.bind(window.location);
-    var _replace = window.location.replace.bind(window.location);
-    window.location.assign  = function(u) { _assign(fixUrl(u)); };
-    window.location.replace = function(u) { _replace(fixUrl(u)); };
-  } catch(e) {}
-
-  // ── Attach input listener to an element ──────────────────────────────────
-  function attachInputListener(el) {
-    if (el._dtcFixed) return;
-    el._dtcFixed = true;
-    ['input','keyup','change','paste'].forEach(function(evtName) {
-      el.addEventListener(evtName, function() {
-        // Immediate trigger
-        triggerReactUpdate(el);
-        // Delayed trigger (React batches state updates)
-        setTimeout(function() {
-          triggerReactUpdate(el);
-          var form = el.closest('form');
-          if (form) forceEnableButtons(form);
-        }, 50);
-        setTimeout(function() {
-          triggerReactUpdate(el);
-          var form = el.closest('form');
-          if (form) forceEnableButtons(form);
-        }, 300);
-      }, true);
-    });
-  }
-
-  // ── Fix all DOM elements ──────────────────────────────────────────────────
-  function fixDOM() {
-    // Fix forms
-    document.querySelectorAll('form').forEach(function(f) {
-      var action = f.getAttribute('action');
-      if (action) f.setAttribute('action', fixUrl(action));
-
-      // Inject CSRF hidden fields
-      var token = getCSRF();
-      if (token) {
-        ['_csrf','_token','csrfmiddlewaretoken','authenticity_token'].forEach(function(name) {
-          var existing = f.querySelector('[name="' + name + '"]');
-          if (existing) { existing.value = token; }
-          else {
-            var inp = document.createElement('input');
-            inp.type = 'hidden'; inp.name = name; inp.value = token;
-            f.appendChild(inp);
-          }
-        });
-      }
-
-      f.addEventListener('submit', function() {
-        var a = f.getAttribute('action');
-        if (a && !a.startsWith('/proxy')) f.setAttribute('action', fixUrl(a));
-      }, true);
-    });
-
-    // Fix links
-    document.querySelectorAll('a[href]').forEach(function(a) {
-      var h = a.getAttribute('href');
-      if (h && !h.startsWith('#') && !h.startsWith('mailto:') && !h.startsWith('tel:')) {
-        a.setAttribute('href', fixUrl(h));
-      }
-    });
-
-    // Attach to all inputs
-    document.querySelectorAll('input, textarea, select').forEach(attachInputListener);
-
-    // Initial button check
-    document.querySelectorAll('form').forEach(forceEnableButtons);
-  }
-
-  // Run on DOM ready
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', fixDOM);
-  } else {
-    fixDOM();
-  }
-
-  // ── Polling loop — keep checking for disabled buttons every 500ms ─────────
-  // React can re-disable buttons on any re-render. We poll to catch this.
-  setInterval(function() {
-    document.querySelectorAll('form').forEach(function(form) {
-      var hasInput = false;
-      form.querySelectorAll('input:not([type="hidden"]):not([type="submit"]):not([type="reset"]), textarea').forEach(function(inp) {
-        if (inp.value && inp.value.trim() !== '') hasInput = true;
-      });
-      if (hasInput) forceEnableButtons(form);
-    });
-  }, 500);
-
-  // ── MutationObserver — watch for React re-renders ─────────────────────────
-  new MutationObserver(function(mutations) {
-    var needsCheck = false;
-    mutations.forEach(function(m) {
-      // Check for attribute changes on buttons (React toggling disabled)
-      if (m.type === 'attributes' && m.attributeName === 'disabled') {
-        var el = m.target;
-        if (el.tagName === 'BUTTON' || el.type === 'submit') {
-          // React just re-disabled a button — check if we should re-enable
-          var form = el.closest('form');
-          if (form) {
-            setTimeout(function() { forceEnableButtons(form); }, 10);
-          }
-        }
-      }
-
-      m.addedNodes.forEach(function(node) {
-        if (!node.querySelectorAll) return;
-        needsCheck = true;
-
-        node.querySelectorAll('form').forEach(function(f) {
-          var a = f.getAttribute('action');
-          if (a) f.setAttribute('action', fixUrl(a));
-          var token = getCSRF();
-          if (token) {
-            var inp = f.querySelector('[name="_csrf"]');
-            if (!inp) { inp = document.createElement('input'); inp.type='hidden'; inp.name='_csrf'; f.appendChild(inp); }
-            inp.value = token;
-          }
-        });
-
-        node.querySelectorAll('a[href]').forEach(function(a) {
-          var h = a.getAttribute('href');
-          if (h && !h.startsWith('#') && !h.startsWith('mailto:')) a.setAttribute('href', fixUrl(h));
-        });
-
-        node.querySelectorAll('input, textarea, select').forEach(attachInputListener);
-      });
-    });
-    if (needsCheck) {
-      setTimeout(function() {
-        document.querySelectorAll('form').forEach(function(form) {
-          var hasInput = false;
-          form.querySelectorAll('input:not([type="hidden"]):not([type="submit"]):not([type="reset"]), textarea').forEach(function(inp) {
-            if (inp.value && inp.value.trim() !== '') hasInput = true;
-          });
-          if (hasInput) forceEnableButtons(form);
-        });
-      }, 100);
-    }
-  }).observe(document.documentElement, {
-    childList: true,
-    subtree: true,
-    attributes: true,
-    attributeFilter: ['disabled']
-  });
-
-  console.log('[DTCWriter] Interceptors v2 active for', BASE);
+  console.info('[DTCWriter] HTTP proxy interceptor active for', UPSTREAM_ORIGIN);
 })();
 </script>`;
 }
